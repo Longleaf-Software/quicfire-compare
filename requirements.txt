@@ -1,0 +1,4 @@
+torch
+numpy
+pillow
+scipy>=1.10.0
