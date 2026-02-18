@@ -9,7 +9,7 @@ Enhanced version (v2.1) with:
   - Rendering-region masking (border/colorbar/title exclusion)
   - Interior-only comparison (anti-aliased boundary erosion)
   - Edge & boundary comparison (Sobel, Hausdorff distance)
-  - Multi-scale error analysis (pyramid downsampling)
+  - Multi-scale analysis (pyramid downsampling)
 
 Compares PlotsFire PNG outputs between any two groups of QUIC-Fire simulation
 runs, detecting statistically significant deviations.  Supports CUDA, Apple
@@ -71,6 +71,14 @@ DEFAULT_BORDER_LEFT = 80     # Y-axis label region width
 DEFAULT_BORDER_RIGHT = 100   # Colorbar region width
 DEFAULT_ERODE_BOUNDARY = 2   # Pixels to erode from fire boundary
 
+# Fire-metric verdict threshold defaults
+DEFAULT_IOU_PASS = 0.95
+DEFAULT_IOU_WARN = 0.85
+DEFAULT_DRIFT_PASS = 5.0       # pixels
+DEFAULT_DRIFT_WARN = 10.0
+DEFAULT_AREA_DIFF_PASS = 0.05  # 5% relative
+DEFAULT_AREA_DIFF_WARN = 0.15  # 15%
+
 # ANSI colour helpers (disabled when stdout is not a terminal)
 _USE_COLOR = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
 
@@ -119,26 +127,50 @@ METHODOLOGY_TEXT_MD = """\
 ## Methodology
 
 This report compares QUIC-Fire simulation outputs between two groups of runs
-(Group A and Group B) using image-comparison metrics computed on the PlotsFire
+(Group A and Group B) using fire-region metrics computed on the PlotsFire
 PNG renderings.
 
-### Perceptual Metrics
+### Image Categorization
+
+Each output image is classified by type:
+
+| Type | Categories |
+|------|-----------|
+| **fire** | `perc_mass_burnt`, `bw_perc_mass_burnt`, `fuel_dens_Plane`, `wplume_Plane` |
+| **wind** | `u_qu_*`, `v_qu_*`, `w_qu_*` |
+| **emissions** | `co_emissions`, `pm_emissions` |
+| **other** | Everything else |
+
+**Verdicts are driven exclusively by fire-category images.**  Wind field
+images use colormap auto-scaling that amplifies tiny float differences into
+large pixel changes; they are reported for information only.
+
+### Fire-Metric Verdicts
+
+| Criterion | PASS | WARN | FAIL |
+|-----------|------|------|------|
+| **Fire IoU** (Intersection over Union) | ≥ 0.95 | ≥ 0.85 | < 0.85 |
+| **Centroid Drift** (pixels) | ≤ 5.0 | ≤ 10.0 | > 10.0 |
+| **Area Diff %** (relative) | ≤ 5% | ≤ 15% | > 15% |
+| **Temporal** | No violations | Violations detected | — |
+
+The overall project verdict is the **worst** of the sub-verdicts.  If no
+fire-category images exist, the project verdict is **SKIP**.
+
+### Perceptual Metrics (Informational)
 
 | Metric | Description |
 |--------|-------------|
-| **MAE** (Mean Absolute Error) | Average per-pixel absolute intensity difference across all channels. Lower is more similar. Range: [0, 255]. |
-| **RMSE** (Root Mean Square Error) | Square root of the mean squared pixel difference. Penalises large localised errors more heavily than MAE. Range: [0, 255]. |
-| **PSNR** (Peak Signal-to-Noise Ratio) | 20·log₁₀(255/RMSE). Higher values indicate greater similarity; infinity for identical images. |
-| **SSIM** (Structural Similarity Index) | Measures luminance, contrast and structural similarity using a sliding Gaussian window (Wang et al., 2004). Range: [-1, 1]; 1 = identical. |
-| **Histogram Correlation** | Pearson correlation between normalised colour histograms (256 bins × 3 channels). Captures global colour-distribution agreement. Range: [-1, 1]; 1 = identical distributions. |
+| **SSIM** (Structural Similarity Index) | Measures luminance, contrast and structural similarity (Wang et al., 2004). Range: [-1, 1]; 1 = identical. Reported for reference; not used for verdicts. |
+| **Histogram Correlation** | Pearson correlation of normalised colour histograms. Range: [-1, 1]; 1 = identical distributions. |
 
-### Fire Region Metrics (NEW)
+### Fire Region Metrics
 
 | Metric | Description |
 |--------|-------------|
-| **Fire IoU** (Intersection over Union) | Overlap of segmented fire regions between images. Range: [0, 1]; 1 = identical fire boundaries. More sensitive to fire-front errors than whole-image metrics. |
+| **Fire IoU** | Overlap of segmented fire regions. Range: [0, 1]; 1 = identical fire boundaries. |
 | **Fire Area Diff** | Absolute difference in fire pixel count. Large values indicate spread-rate bugs. |
-| **Centroid Drift** | Euclidean distance between fire region centroids. Indicates spatial displacement of fire. |
+| **Centroid Drift** | Euclidean distance between fire region centroids. Indicates spatial displacement. |
 
 ### Comparison Design
 
@@ -150,23 +182,7 @@ image comparisons:
 * **Intra-B** — pairs drawn from runs within Group B.
 * **Cross** — pairs with one run from Group A and one from Group B.
 
-### Deviation Score
-
-The *deviation score* quantifies whether cross-group differences exceed
-what is expected from intra-group variability.  It is computed as a
-z-score:
-
-    deviation = (cross_MAE_mean − intra_MAE_mean) / intra_MAE_std
-
-where `intra_MAE_mean` and `intra_MAE_std` are pooled from both intra-A
-and intra-B MAE values.
-
-Verdicts:
-* **PASS** — deviation ≤ σ threshold (default 2.0).
-* **WARN** — deviation ≤ 2 × σ threshold.
-* **FAIL** — deviation > 2 × σ threshold.
-
-### Temporal Monotonicity (NEW)
+### Temporal Monotonicity
 
 Fire simulations should exhibit monotonic growth (fire area should not
 decrease significantly over time).  The tool detects timesteps where fire
@@ -177,12 +193,11 @@ area decreases by more than 5%, which may indicate:
 
 ### Flagged Images
 
-Individual images whose average cross-group MAE exceeds
-`intra_MAE_mean + σ · max(intra_MAE_std, 0.01)` are flagged for manual
-review.  Up to 20 flagged images are reported per project, sorted by
-descending MAE.
+Fire-category images whose average cross-group IoU falls below the IoU
+threshold are flagged for manual review.  Up to 20 flagged images are
+reported per project, sorted by ascending IoU (worst first).
 
-### Difference Heatmaps (NEW)
+### Difference Heatmaps
 
 For flagged images, pixel-wise difference heatmaps are generated showing
 where the two images differ most.  Brighter regions indicate larger errors,
@@ -197,9 +212,6 @@ METHODOLOGY_TEXT_HTML = METHODOLOGY_TEXT_MD  # rendered via markdown section in 
 # ───────────────────────────────────────────────────────────────────────────
 
 class Metrics(NamedTuple):
-    mae: float
-    rmse: float
-    psnr: float
     ssim_val: float
     hist_corr: float
 
@@ -217,17 +229,12 @@ class FireMetrics(NamedTuple):
 
 class MaskedMetrics(NamedTuple):
     """Metrics computed with rendering regions masked out."""
-    masked_mae: float
-    masked_rmse: float
-    unmasked_mae: float      # Original MAE for comparison
-    unmasked_rmse: float     # Original RMSE for comparison
+    masked_ssim: float       # SSIM computed on masked region
     mask_coverage: float     # Fraction of pixels included (0-1)
-    rendering_diff: float    # MAE in rendering regions only (for diagnostics)
 
 
 class EdgeMetrics(NamedTuple):
     """Edge and boundary comparison metrics."""
-    edge_mae: float
     edge_correlation: float
     edge_iou: float
     boundary_iou: float
@@ -243,9 +250,9 @@ class TemporalGradientAnalysis:
     exponential_rate: float         # Exponential growth rate (if applicable)
     exponential_r_squared: float    # Goodness of fit for exponential model
     best_fit: str                   # "linear", "exponential", or "stable"
-    early_phase_mae: float          # Mean MAE in first 1/3 of timesteps
-    mid_phase_mae: float            # Mean MAE in middle 1/3
-    late_phase_mae: float           # Mean MAE in last 1/3
+    early_phase_ssim: float         # Mean SSIM in first 1/3 of timesteps
+    mid_phase_ssim: float           # Mean SSIM in middle 1/3
+    late_phase_ssim: float          # Mean SSIM in last 1/3
     acceleration: float             # Second derivative (is error growth accelerating?)
 
 
@@ -253,7 +260,6 @@ class TemporalGradientAnalysis:
 class MultiscaleMetrics:
     """Multi-resolution analysis results."""
     scale_factors: list
-    maes: list
     ssims: list
     dominant_scale: str  # "fine", "coarse", "uniform"
     fine_to_coarse_ratio: float
@@ -275,6 +281,7 @@ class ComparisonResult:
     edge_metrics: EdgeMetrics | None = None
     path_a: str = ""          # Path to image A (for heatmap generation)
     path_b: str = ""          # Path to image B (for heatmap generation)
+    image_type: str = ""      # "fire", "wind", "emissions", or "other"
 
 
 @dataclass
@@ -293,36 +300,41 @@ class ProjectSummary:
     project: str
     n_images: int = 0
     n_comparisons: int = 0
-    intra_a_mae_mean: float = 0.0
-    intra_a_mae_std: float = 0.0
-    intra_b_mae_mean: float = 0.0
-    intra_b_mae_std: float = 0.0
-    cross_mae_mean: float = 0.0
-    cross_mae_std: float = 0.0
-    intra_a_rmse_mean: float = 0.0
-    intra_b_rmse_mean: float = 0.0
-    cross_rmse_mean: float = 0.0
     intra_a_ssim_mean: float = 0.0
+    intra_a_ssim_std: float = 0.0
     intra_b_ssim_mean: float = 0.0
+    intra_b_ssim_std: float = 0.0
     cross_ssim_mean: float = 0.0
+    cross_ssim_std: float = 0.0
     # Fire metrics
     cross_iou_mean: float = 0.0
     cross_iou_std: float = 0.0
     intra_iou_mean: float = 0.0
     cross_centroid_drift_mean: float = 0.0
     # Masked metrics
-    cross_masked_mae_mean: float = 0.0
+    cross_masked_ssim_mean: float = 0.0
     mask_coverage_mean: float = 0.0
     # Edge metrics
-    cross_edge_mae_mean: float = 0.0
     cross_boundary_iou_mean: float = 0.0
     cross_hausdorff_mean: float = 0.0
+    # Fire-category cross metrics (verdict-driving)
+    fire_cross_iou_mean: float = 0.0
+    fire_cross_iou_std: float = 0.0
+    fire_cross_drift_mean: float = 0.0
+    fire_cross_drift_std: float = 0.0
+    fire_cross_area_diff_pct_mean: float = 0.0
+    fire_cross_area_diff_pct_std: float = 0.0
+    fire_n_cross_comparisons: int = 0
     # Temporal
     temporal_violations: list[TemporalViolation] = field(default_factory=list)
-    mae_temporal_gradient: float = 0.0  # Positive = errors accumulating over time
+    ssim_temporal_gradient: float = 0.0  # Negative = similarity degrading over time
     temporal_gradient_analysis: TemporalGradientAnalysis | None = None
     # Verdict
     deviation_score: float = 0.0
+    iou_verdict: str = "N/A"
+    drift_verdict: str = "N/A"
+    area_diff_verdict: str = "N/A"
+    temporal_verdict: str = "N/A"
     verdict: str = "SKIP"
     flagged_images: list = field(default_factory=list)
 
@@ -331,7 +343,7 @@ class ProjectSummary:
 class FlaggedImageData:
     """Extended data for flagged images including difference heatmap."""
     png_name: str
-    avg_mae: float
+    avg_ssim: float
     avg_iou: float
     diff_heatmap_base64: str | None = None  # Base64-encoded PNG for HTML embedding
     multiscale_analysis: MultiscaleMetrics | None = None
@@ -349,6 +361,7 @@ class TaskInfo:
     platform_pair: str
     path_a: str
     path_b: str
+    image_type: str = ""      # "fire", "wind", "emissions", or "other"
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -469,8 +482,24 @@ def classify_png(name: str) -> tuple[str, int]:
     return cat, timestep
 
 
+_FIRE_RE = re.compile(r"(perc_mass_burnt|bw_perc_mass_burnt|fuel_dens_Plane|wplume_Plane)")
+_WIND_RE = re.compile(r"(u_qu_|v_qu_|w_qu_)")
+_EMISSIONS_RE = re.compile(r"(co_emissions|pm_emissions)")
+
+
+def classify_image_type(category: str) -> str:
+    """Classify a PNG category into fire/wind/emissions/other."""
+    if _FIRE_RE.search(category):
+        return "fire"
+    if _WIND_RE.search(category):
+        return "wind"
+    if _EMISSIONS_RE.search(category):
+        return "emissions"
+    return "other"
+
+
 # ───────────────────────────────────────────────────────────────────────────
-#  Fire Segmentation (NEW)
+#  Fire Segmentation
 # ───────────────────────────────────────────────────────────────────────────
 
 def segment_fire_region(
@@ -643,7 +672,7 @@ def compute_masked_metrics(
     rendering_mask: np.ndarray | None = None,
     interior_mask: np.ndarray | None = None,
 ) -> dict[str, float]:
-    """Compute MAE and RMSE with masking applied.
+    """Compute pixel-level correlation with masking applied.
 
     Args:
         img_a, img_b: RGB images as numpy arrays (H, W, 3)
@@ -651,7 +680,7 @@ def compute_masked_metrics(
         interior_mask: Mask excluding anti-aliased boundaries (True = include)
 
     Returns:
-        Dictionary with masked_mae, masked_rmse, mask_coverage
+        Dictionary with masked_ssim (approximated via correlation), mask_coverage
     """
     h, w = img_a.shape[:2]
 
@@ -668,20 +697,21 @@ def compute_masked_metrics(
 
     if masked_pixels == 0:
         return {
-            "masked_mae": 0.0,
-            "masked_rmse": 0.0,
+            "masked_ssim": 1.0,
             "mask_coverage": 0.0,
         }
 
-    diff = np.abs(img_a.astype(np.float32) - img_b.astype(np.float32))
     mask_3d = np.stack([combined_mask] * 3, axis=2)
-    masked_diff = diff[mask_3d]
-    masked_mae = float(masked_diff.mean())
-    masked_rmse = float(np.sqrt((masked_diff ** 2).mean()))
+    a_vals = img_a.astype(np.float32)[mask_3d]
+    b_vals = img_b.astype(np.float32)[mask_3d]
+    a_centered = a_vals - a_vals.mean()
+    b_centered = b_vals - b_vals.mean()
+    num = (a_centered * b_centered).sum()
+    den = np.sqrt((a_centered ** 2).sum() * (b_centered ** 2).sum())
+    corr = float(num / den) if den > 0 else 1.0
 
     return {
-        "masked_mae": masked_mae,
-        "masked_rmse": masked_rmse,
+        "masked_ssim": corr,
         "mask_coverage": coverage,
     }
 
@@ -697,7 +727,6 @@ def compute_edge_metrics(
     """Compare edge structures between two images.
 
     Uses Sobel operators to extract edges, then compares:
-    - Edge MAE: Mean absolute difference of edge magnitudes
     - Edge correlation: Pearson correlation of edge maps
     - Edge IoU: Overlap of thresholded edge pixels
     """
@@ -711,8 +740,6 @@ def compute_edge_metrics(
 
     edges_a = edge_magnitude(gray_a)
     edges_b = edge_magnitude(gray_b)
-
-    edge_mae = float(np.abs(edges_a - edges_b).mean())
 
     ea_flat = edges_a.flatten()
     eb_flat = edges_b.flatten()
@@ -734,7 +761,6 @@ def compute_edge_metrics(
     edge_iou = float(intersection / union) if union > 0 else 1.0
 
     return {
-        "edge_mae": edge_mae,
         "edge_correlation": edge_correlation,
         "edge_iou": edge_iou,
     }
@@ -799,12 +825,11 @@ def compute_multiscale_metrics(
     levels: int = 4,
     min_size: int = 32,
 ) -> dict[str, list[float]]:
-    """Compute MAE and correlation at multiple resolutions."""
+    """Compute correlation at multiple resolutions."""
     pil_a = Image.fromarray(img_a)
     pil_b = Image.fromarray(img_b)
 
     scale_factors = []
-    maes = []
     ssims = []
 
     current_a = pil_a
@@ -814,9 +839,6 @@ def compute_multiscale_metrics(
     for level in range(levels):
         arr_a = np.array(current_a).astype(np.float32)
         arr_b = np.array(current_b).astype(np.float32)
-
-        mae = np.abs(arr_a - arr_b).mean()
-        maes.append(float(mae))
 
         a_flat = arr_a.flatten()
         b_flat = arr_b.flatten()
@@ -841,29 +863,30 @@ def compute_multiscale_metrics(
 
     return {
         "scale_factors": scale_factors,
-        "maes": maes,
         "ssims": ssims,
     }
 
 
 def analyze_scale_pattern(multiscale: dict[str, list[float]]) -> dict:
-    """Analyze the pattern of errors across scales."""
-    maes = multiscale["maes"]
+    """Analyze the pattern of similarity across scales."""
+    ssims = multiscale["ssims"]
 
-    if len(maes) < 2:
+    if len(ssims) < 2:
         return {
             "dominant_scale": "uniform",
             "fine_to_coarse_ratio": 1.0,
             "scale_gradient": 0.0,
         }
 
-    fine_mae = maes[0]
-    coarse_mae = maes[-1]
+    # Use (1 - ssim) as error proxy for scale analysis
+    fine_err = 1.0 - ssims[0]
+    coarse_err = 1.0 - ssims[-1]
 
-    ratio = fine_mae / coarse_mae if coarse_mae > 0.001 else float('inf')
+    ratio = fine_err / coarse_err if coarse_err > 0.001 else float('inf')
 
     try:
-        gradient = np.polyfit(range(len(maes)), maes, 1)[0]
+        errors = [1.0 - s for s in ssims]
+        gradient = np.polyfit(range(len(errors)), errors, 1)[0]
     except (np.linalg.LinAlgError, ValueError):
         gradient = 0.0
 
@@ -882,7 +905,7 @@ def analyze_scale_pattern(multiscale: dict[str, list[float]]) -> dict:
 
 
 # ───────────────────────────────────────────────────────────────────────────
-#  Difference Heatmap Generation (NEW)
+#  Difference Heatmap Generation
 # ───────────────────────────────────────────────────────────────────────────
 
 def compute_difference_heatmap(
@@ -1146,18 +1169,6 @@ def process_batch_gpu(
     batch_b = batch_b.to(device, non_blocking=True)
     pixel_counts = pixel_counts.to(device, non_blocking=True)
 
-    # MAE / RMSE / PSNR
-    diff = torch.abs(batch_a - batch_b)
-    mae_vals = diff.sum(dim=(1, 2, 3)) / pixel_counts
-    rmse_vals = torch.sqrt((diff ** 2).sum(dim=(1, 2, 3)) / pixel_counts)
-    psnr_vals = torch.where(
-        rmse_vals > 0,
-        20.0 * torch.log10(torch.tensor(255.0, device=device) / rmse_vals),
-        torch.tensor(float("inf"), device=device),
-    )
-    del diff
-    _clear_device_cache(device)
-
     # Histogram correlation
     hist_vals = histogram_correlation_batch(batch_a, batch_b)
 
@@ -1192,14 +1203,11 @@ def process_batch_gpu(
             _clear_device_cache(device)
 
     # Collect to CPU
-    mae_cpu = mae_vals.cpu().numpy()
-    rmse_cpu = rmse_vals.cpu().numpy()
-    psnr_cpu = psnr_vals.cpu().numpy()
     ssim_cpu = ssim_vals.cpu().numpy()
     hist_cpu = hist_vals.cpu().numpy()
 
     # Return GPU results + raw pairs for CPU post-processing
-    return mae_cpu, rmse_cpu, psnr_cpu, ssim_cpu, hist_cpu, raw_pairs
+    return ssim_cpu, hist_cpu, raw_pairs
 
 
 def _compute_pair_cpu_metrics(args: tuple) -> tuple[FireMetrics, MaskedMetrics, EdgeMetrics | None]:
@@ -1208,7 +1216,7 @@ def _compute_pair_cpu_metrics(args: tuple) -> tuple[FireMetrics, MaskedMetrics, 
     Designed to run in a ThreadPoolExecutor — numpy/scipy release the GIL
     so multiple pairs are processed in true parallel across CPU cores.
     """
-    (arr_a, arr_b, mae_val, rmse_val, fire_threshold, fire_channels,
+    (arr_a, arr_b, fire_threshold, fire_channels,
      mask_rendering, mask_boundaries, border_top, border_bottom,
      border_left, border_right, erode_boundary, do_edges) = args
 
@@ -1230,19 +1238,9 @@ def _compute_pair_cpu_metrics(args: tuple) -> tuple[FireMetrics, MaskedMetrics, 
 
     masked = compute_masked_metrics(arr_a, arr_b, rendering_mask, interior_mask)
 
-    if rendering_mask is not None:
-        render_only = compute_masked_metrics(arr_a, arr_b, ~rendering_mask, None)
-        rendering_diff = render_only["masked_mae"]
-    else:
-        rendering_diff = 0.0
-
     mm = MaskedMetrics(
-        masked_mae=masked["masked_mae"],
-        masked_rmse=masked["masked_rmse"],
-        unmasked_mae=float(mae_val),
-        unmasked_rmse=float(rmse_val),
+        masked_ssim=masked["masked_ssim"],
         mask_coverage=masked["mask_coverage"],
-        rendering_diff=rendering_diff,
     )
 
     # Edge metrics
@@ -1251,7 +1249,6 @@ def _compute_pair_cpu_metrics(args: tuple) -> tuple[FireMetrics, MaskedMetrics, 
         edge_m = compute_edge_metrics(arr_a, arr_b)
         boundary_m = compute_fire_boundary_metrics(arr_a, arr_b, fire_threshold)
         em = EdgeMetrics(
-            edge_mae=edge_m["edge_mae"],
             edge_correlation=edge_m["edge_correlation"],
             edge_iou=edge_m["edge_iou"],
             boundary_iou=boundary_m["boundary_iou"],
@@ -1264,9 +1261,6 @@ def _compute_pair_cpu_metrics(args: tuple) -> tuple[FireMetrics, MaskedMetrics, 
 
 def _assemble_results(
     batch_tasks: list[TaskInfo],
-    mae_cpu: np.ndarray,
-    rmse_cpu: np.ndarray,
-    psnr_cpu: np.ndarray,
     ssim_cpu: np.ndarray,
     hist_cpu: np.ndarray,
     cpu_metrics: list[tuple[FireMetrics, MaskedMetrics, EdgeMetrics | None]],
@@ -1276,9 +1270,6 @@ def _assemble_results(
     for i, task in enumerate(batch_tasks):
         fm, mm, em = cpu_metrics[i]
         m = Metrics(
-            mae=float(mae_cpu[i]),
-            rmse=float(rmse_cpu[i]),
-            psnr=float(psnr_cpu[i]),
             ssim_val=float(ssim_cpu[i]),
             hist_corr=float(hist_cpu[i]),
         )
@@ -1296,6 +1287,7 @@ def _assemble_results(
             edge_metrics=em,
             path_a=task.path_a,
             path_b=task.path_b,
+            image_type=task.image_type,
         ))
     return results
 
@@ -1333,6 +1325,7 @@ def build_comparison_tasks(
 
         for png_name in common_pngs:
             cat, ts = classify_png(png_name)
+            img_type = classify_image_type(cat)
 
             # Intra-A
             for (ra, pa), (rb, pb) in itertools.combinations(pf_a, 2):
@@ -1341,6 +1334,7 @@ def build_comparison_tasks(
                     timestep=ts, run_a=ra.name, run_b=rb.name,
                     platform_pair="intra_a",
                     path_a=str(pa / png_name), path_b=str(pb / png_name),
+                    image_type=img_type,
                 ))
 
             # Intra-B
@@ -1350,6 +1344,7 @@ def build_comparison_tasks(
                     timestep=ts, run_a=ra.name, run_b=rb.name,
                     platform_pair="intra_b",
                     path_a=str(pa / png_name), path_b=str(pb / png_name),
+                    image_type=img_type,
                 ))
 
             # Cross
@@ -1360,13 +1355,14 @@ def build_comparison_tasks(
                         timestep=ts, run_a=ra.name, run_b=rb.name,
                         platform_pair="cross",
                         path_a=str(pa / png_name), path_b=str(pb / png_name),
+                        image_type=img_type,
                     ))
 
     return tasks
 
 
 # ───────────────────────────────────────────────────────────────────────────
-#  Temporal Monotonicity Analysis (NEW)
+#  Temporal Monotonicity Analysis
 # ───────────────────────────────────────────────────────────────────────────
 
 def analyze_temporal_monotonicity(
@@ -1431,35 +1427,35 @@ def analyze_temporal_monotonicity(
     return violations
 
 
-def compute_mae_temporal_gradient(
+def compute_ssim_temporal_gradient(
     results: list[ComparisonResult],
 ) -> float:
-    """Compute linear trend of MAE over time.
+    """Compute linear trend of SSIM over time.
     
-    Positive gradient indicates errors accumulating over time (integration bugs).
+    Negative gradient indicates similarity degrading over time (integration bugs).
     
     Returns:
-        Slope of MAE vs timestep linear fit, or 0.0 if insufficient data
+        Slope of SSIM vs timestep linear fit, or 0.0 if insufficient data
     """
     cross_results = [r for r in results if r.platform_pair == "cross" and r.timestep >= 0]
     if len(cross_results) < 3:
         return 0.0
     
-    # Group MAE by timestep
-    ts_maes: dict[int, list[float]] = defaultdict(list)
+    # Group SSIM by timestep
+    ts_ssims: dict[int, list[float]] = defaultdict(list)
     for r in cross_results:
-        ts_maes[r.timestep].append(r.metrics.mae)
+        ts_ssims[r.timestep].append(r.metrics.ssim_val)
     
-    if len(ts_maes) < 2:
+    if len(ts_ssims) < 2:
         return 0.0
     
-    # Compute average MAE per timestep
-    timesteps = sorted(ts_maes.keys())
-    avg_maes = [np.mean(ts_maes[t]) for t in timesteps]
+    # Compute average SSIM per timestep
+    timesteps = sorted(ts_ssims.keys())
+    avg_ssims = [np.mean(ts_ssims[t]) for t in timesteps]
     
     # Linear fit
     try:
-        slope = np.polyfit(timesteps, avg_maes, 1)[0]
+        slope = np.polyfit(timesteps, avg_ssims, 1)[0]
         return float(slope)
     except (np.linalg.LinAlgError, ValueError):
         return 0.0
@@ -1470,48 +1466,51 @@ def analyze_temporal_gradient_detailed(
 ) -> TemporalGradientAnalysis | None:
     """Perform detailed temporal gradient analysis.
 
-    Fits both linear and exponential models to MAE over time,
+    Fits both linear and exponential models to SSIM over time,
     segments the simulation into phases, and detects acceleration.
     """
     cross_results = [r for r in results if r.platform_pair == "cross" and r.timestep >= 0]
     if len(cross_results) < 6:
         return None
 
-    ts_maes: dict[int, list[float]] = defaultdict(list)
+    ts_ssims: dict[int, list[float]] = defaultdict(list)
     for r in cross_results:
-        ts_maes[r.timestep].append(r.metrics.mae)
+        ts_ssims[r.timestep].append(r.metrics.ssim_val)
 
-    if len(ts_maes) < 4:
+    if len(ts_ssims) < 4:
         return None
 
-    timesteps = np.array(sorted(ts_maes.keys()))
-    avg_maes = np.array([np.mean(ts_maes[t]) for t in timesteps])
+    timesteps = np.array(sorted(ts_ssims.keys()))
+    avg_ssims = np.array([np.mean(ts_ssims[t]) for t in timesteps])
     t_normalized = timesteps - timesteps[0]
+
+    # Use (1 - SSIM) as error metric for fitting
+    avg_errors = 1.0 - avg_ssims
 
     # Linear fit
     try:
-        linear_coeffs = np.polyfit(t_normalized, avg_maes, 1)
+        linear_coeffs = np.polyfit(t_normalized, avg_errors, 1)
         linear_gradient = float(linear_coeffs[0])
         linear_predicted = np.polyval(linear_coeffs, t_normalized)
-        ss_res_linear = np.sum((avg_maes - linear_predicted) ** 2)
-        ss_tot = np.sum((avg_maes - np.mean(avg_maes)) ** 2)
+        ss_res_linear = np.sum((avg_errors - linear_predicted) ** 2)
+        ss_tot = np.sum((avg_errors - np.mean(avg_errors)) ** 2)
         linear_r_squared = 1 - (ss_res_linear / ss_tot) if ss_tot > 0 else 0.0
     except (np.linalg.LinAlgError, ValueError):
         linear_gradient = 0.0
         linear_r_squared = 0.0
-        ss_tot = np.sum((avg_maes - np.mean(avg_maes)) ** 2)
+        ss_tot = np.sum((avg_errors - np.mean(avg_errors)) ** 2)
 
     # Exponential fit
     def exp_func(t, a, b, c):
         return a * np.exp(b * t) + c
 
     try:
-        p0 = [0.1, 0.001, avg_maes[0]]
+        p0 = [0.1, 0.001, avg_errors[0]]
         bounds = ([0, 0, 0], [np.inf, 1.0, np.inf])
-        popt, _ = curve_fit(exp_func, t_normalized, avg_maes, p0=p0, bounds=bounds, maxfev=1000)
+        popt, _ = curve_fit(exp_func, t_normalized, avg_errors, p0=p0, bounds=bounds, maxfev=1000)
         exponential_rate = float(popt[1])
         exp_predicted = exp_func(t_normalized, *popt)
-        ss_res_exp = np.sum((avg_maes - exp_predicted) ** 2)
+        ss_res_exp = np.sum((avg_errors - exp_predicted) ** 2)
         exponential_r_squared = 1 - (ss_res_exp / ss_tot) if ss_tot > 0 else 0.0
     except (RuntimeError, ValueError):
         exponential_rate = 0.0
@@ -1527,13 +1526,13 @@ def analyze_temporal_gradient_detailed(
     # Phase analysis
     n = len(timesteps)
     third = n // 3
-    early_phase_mae = float(np.mean(avg_maes[:third])) if third > 0 else 0.0
-    mid_phase_mae = float(np.mean(avg_maes[third:2*third])) if third > 0 else 0.0
-    late_phase_mae = float(np.mean(avg_maes[2*third:])) if third > 0 else 0.0
+    early_phase_ssim = float(np.mean(avg_ssims[:third])) if third > 0 else 0.0
+    mid_phase_ssim = float(np.mean(avg_ssims[third:2*third])) if third > 0 else 0.0
+    late_phase_ssim = float(np.mean(avg_ssims[2*third:])) if third > 0 else 0.0
 
     # Acceleration
     try:
-        quad_coeffs = np.polyfit(t_normalized, avg_maes, 2)
+        quad_coeffs = np.polyfit(t_normalized, avg_errors, 2)
         acceleration = float(2 * quad_coeffs[0])
     except (np.linalg.LinAlgError, ValueError):
         acceleration = 0.0
@@ -1544,9 +1543,9 @@ def analyze_temporal_gradient_detailed(
         exponential_rate=exponential_rate,
         exponential_r_squared=float(exponential_r_squared),
         best_fit=best_fit,
-        early_phase_mae=early_phase_mae,
-        mid_phase_mae=mid_phase_mae,
-        late_phase_mae=late_phase_mae,
+        early_phase_ssim=early_phase_ssim,
+        mid_phase_ssim=mid_phase_ssim,
+        late_phase_ssim=late_phase_ssim,
         acceleration=acceleration,
     )
 
@@ -1555,11 +1554,11 @@ def analyze_temporal_gradient_detailed(
 #  Statistical Analysis
 # ───────────────────────────────────────────────────────────────────────────
 
-def get_comparison_mae(r: ComparisonResult, use_masked: bool = True) -> float:
-    """Get the appropriate MAE value based on masking preference."""
+def get_comparison_ssim(r: ComparisonResult, use_masked: bool = True) -> float:
+    """Get the appropriate SSIM value based on masking preference."""
     if use_masked and r.masked_metrics is not None:
-        return r.masked_metrics.masked_mae
-    return r.metrics.mae
+        return r.masked_metrics.masked_ssim
+    return r.metrics.ssim_val
 
 
 def analyze_results(
@@ -1567,6 +1566,12 @@ def analyze_results(
     project_names: list[str],
     sigma_threshold: float,
     use_masked: bool = True,
+    iou_threshold: float = DEFAULT_IOU_PASS,
+    iou_warn_threshold: float = DEFAULT_IOU_WARN,
+    drift_threshold: float = DEFAULT_DRIFT_PASS,
+    drift_warn_threshold: float = DEFAULT_DRIFT_WARN,
+    area_diff_threshold: float = DEFAULT_AREA_DIFF_PASS,
+    area_diff_warn_threshold: float = DEFAULT_AREA_DIFF_WARN,
 ) -> list[ProjectSummary]:
     by_project = defaultdict(list)
     for r in results:
@@ -1594,93 +1599,132 @@ def analyze_results(
                 return 0.0, 0.0
             return float(np.mean(vals)), float(np.std(vals))
 
-        a_maes = [get_comparison_mae(r, use_masked) for r in intra_a]
-        b_maes = [get_comparison_mae(r, use_masked) for r in intra_b]
-        cross_maes = [get_comparison_mae(r, use_masked) for r in cross]
+        a_ssims = [get_comparison_ssim(r, use_masked) for r in intra_a]
+        b_ssims = [get_comparison_ssim(r, use_masked) for r in intra_b]
+        cross_ssims = [get_comparison_ssim(r, use_masked) for r in cross]
 
-        summary.intra_a_mae_mean, summary.intra_a_mae_std = safe_stats(a_maes)
-        summary.intra_b_mae_mean, summary.intra_b_mae_std = safe_stats(b_maes)
-        summary.cross_mae_mean, summary.cross_mae_std = safe_stats(cross_maes)
+        summary.intra_a_ssim_mean, summary.intra_a_ssim_std = safe_stats(a_ssims)
+        summary.intra_b_ssim_mean, summary.intra_b_ssim_std = safe_stats(b_ssims)
+        summary.cross_ssim_mean, summary.cross_ssim_std = safe_stats(cross_ssims)
 
-        summary.intra_a_rmse_mean = safe_stats([r.metrics.rmse for r in intra_a])[0]
-        summary.intra_b_rmse_mean = safe_stats([r.metrics.rmse for r in intra_b])[0]
-        summary.cross_rmse_mean = safe_stats([r.metrics.rmse for r in cross])[0]
-
-        a_ssims = [r.metrics.ssim_val for r in intra_a if r.metrics.ssim_val >= 0]
-        b_ssims = [r.metrics.ssim_val for r in intra_b if r.metrics.ssim_val >= 0]
-        cross_ssims = [r.metrics.ssim_val for r in cross if r.metrics.ssim_val >= 0]
-        summary.intra_a_ssim_mean = safe_stats(a_ssims)[0]
-        summary.intra_b_ssim_mean = safe_stats(b_ssims)[0]
-        summary.cross_ssim_mean = safe_stats(cross_ssims)[0]
-
-        # Fire metrics (NEW)
+        # All-image fire metrics (for informational display)
         cross_ious = [r.fire_metrics.iou for r in cross if r.fire_metrics is not None]
         intra_ious = ([r.fire_metrics.iou for r in intra_a if r.fire_metrics is not None] +
                       [r.fire_metrics.iou for r in intra_b if r.fire_metrics is not None])
         cross_drifts = [r.fire_metrics.centroid_drift for r in cross if r.fire_metrics is not None]
-        
+
         summary.cross_iou_mean, summary.cross_iou_std = safe_stats(cross_ious)
         summary.intra_iou_mean = safe_stats(intra_ious)[0]
         summary.cross_centroid_drift_mean = safe_stats(cross_drifts)[0]
 
+        # Fire-category cross metrics (verdict-driving)
+        fire_cross = [r for r in cross if r.image_type == "fire" and r.fire_metrics is not None]
+        fire_cross_ious = [r.fire_metrics.iou for r in fire_cross]
+        fire_cross_drifts = [r.fire_metrics.centroid_drift for r in fire_cross]
+        fire_cross_area_diff_pcts = [
+            abs(r.fire_metrics.area_diff) / max(r.fire_metrics.area_a, r.fire_metrics.area_b, 1)
+            for r in fire_cross
+        ]
+        summary.fire_cross_iou_mean, summary.fire_cross_iou_std = safe_stats(fire_cross_ious)
+        summary.fire_cross_drift_mean, summary.fire_cross_drift_std = safe_stats(fire_cross_drifts)
+        summary.fire_cross_area_diff_pct_mean, summary.fire_cross_area_diff_pct_std = safe_stats(fire_cross_area_diff_pcts)
+        summary.fire_n_cross_comparisons = len(fire_cross)
+
         # Masked metrics summary
-        cross_masked_maes = [r.masked_metrics.masked_mae for r in cross if r.masked_metrics is not None]
+        cross_masked_ssims = [r.masked_metrics.masked_ssim for r in cross if r.masked_metrics is not None]
         cross_coverages = [r.masked_metrics.mask_coverage for r in cross if r.masked_metrics is not None]
-        summary.cross_masked_mae_mean = safe_stats(cross_masked_maes)[0]
+        summary.cross_masked_ssim_mean = safe_stats(cross_masked_ssims)[0]
         summary.mask_coverage_mean = safe_stats(cross_coverages)[0]
 
         # Edge metrics summary
-        cross_edge_maes = [r.edge_metrics.edge_mae for r in cross if r.edge_metrics is not None]
         cross_boundary_ious = [r.edge_metrics.boundary_iou for r in cross if r.edge_metrics is not None]
         cross_hausdorffs = [r.edge_metrics.hausdorff_approx for r in cross if r.edge_metrics is not None]
-        summary.cross_edge_mae_mean = safe_stats(cross_edge_maes)[0]
         summary.cross_boundary_iou_mean = safe_stats(cross_boundary_ious)[0]
         summary.cross_hausdorff_mean = safe_stats(cross_hausdorffs)[0]
 
-        # Temporal analysis (NEW)
+        # Temporal analysis
         summary.temporal_violations = analyze_temporal_monotonicity(rs, pt)
-        summary.mae_temporal_gradient = compute_mae_temporal_gradient(rs)
+        summary.ssim_temporal_gradient = compute_ssim_temporal_gradient(rs)
         summary.temporal_gradient_analysis = analyze_temporal_gradient_detailed(rs)
 
-        # Deviation score
-        intra_all_maes = a_maes + b_maes
-        if intra_all_maes:
-            intra_mean, intra_std = safe_stats(intra_all_maes)
+        # Deviation score (SSIM-based, informational only)
+        intra_all_ssims = a_ssims + b_ssims
+        if intra_all_ssims:
+            intra_mean, intra_std = safe_stats(intra_all_ssims)
             if intra_std > 0:
-                summary.deviation_score = (summary.cross_mae_mean - intra_mean) / intra_std
-            elif summary.cross_mae_mean > intra_mean:
+                summary.deviation_score = (intra_mean - summary.cross_ssim_mean) / intra_std
+            elif summary.cross_ssim_mean < intra_mean:
                 summary.deviation_score = float("inf")
             else:
                 summary.deviation_score = 0.0
         else:
-            summary.deviation_score = summary.cross_mae_mean
+            summary.deviation_score = 1.0 - summary.cross_ssim_mean
 
-        if summary.deviation_score <= sigma_threshold:
-            summary.verdict = "PASS"
-        elif summary.deviation_score <= sigma_threshold * 2:
+        # Per-criterion fire-metric verdicts
+        if fire_cross:
+            # IoU verdict (higher is better)
+            if summary.fire_cross_iou_mean >= iou_threshold:
+                summary.iou_verdict = "PASS"
+            elif summary.fire_cross_iou_mean >= iou_warn_threshold:
+                summary.iou_verdict = "WARN"
+            else:
+                summary.iou_verdict = "FAIL"
+
+            # Drift verdict (lower is better)
+            if summary.fire_cross_drift_mean <= drift_threshold:
+                summary.drift_verdict = "PASS"
+            elif summary.fire_cross_drift_mean <= drift_warn_threshold:
+                summary.drift_verdict = "WARN"
+            else:
+                summary.drift_verdict = "FAIL"
+
+            # Area diff verdict (lower is better)
+            if summary.fire_cross_area_diff_pct_mean <= area_diff_threshold:
+                summary.area_diff_verdict = "PASS"
+            elif summary.fire_cross_area_diff_pct_mean <= area_diff_warn_threshold:
+                summary.area_diff_verdict = "WARN"
+            else:
+                summary.area_diff_verdict = "FAIL"
+        # else: all remain "N/A"
+
+        # Temporal verdict
+        if summary.temporal_violations:
+            summary.temporal_verdict = "WARN"
+        else:
+            summary.temporal_verdict = "PASS"
+
+        # Overall verdict = worst of sub-verdicts (ignoring N/A)
+        sub_verdicts = [summary.iou_verdict, summary.drift_verdict,
+                        summary.area_diff_verdict, summary.temporal_verdict]
+        active = [v for v in sub_verdicts if v != "N/A"]
+        if not active:
+            summary.verdict = "SKIP"
+        elif any(v == "FAIL" for v in active):
+            summary.verdict = "FAIL"
+        elif any(v == "WARN" for v in active):
             summary.verdict = "WARN"
         else:
-            summary.verdict = "FAIL"
+            summary.verdict = "PASS"
 
-        # Flagged images
-        if intra_all_maes:
-            intra_mean, intra_std = safe_stats(intra_all_maes)
-            threshold_val = intra_mean + sigma_threshold * max(intra_std, 0.01)
-        else:
-            threshold_val = 1.0
-
+        # Flagged images (fire-category IoU below threshold)
         cross_by_png = defaultdict(list)
         for r in cross:
             cross_by_png[r.png_name].append(r)
 
         flagged = []
         for png_name, crs in cross_by_png.items():
-            avg_mae = np.mean([r.metrics.mae for r in crs])
-            avg_iou = np.mean([r.fire_metrics.iou for r in crs if r.fire_metrics is not None])
-            if avg_mae > threshold_val:
-                flagged.append((png_name, float(avg_mae), float(avg_iou)))
+            # Only flag fire-category images
+            if not any(r.image_type == "fire" for r in crs):
+                continue
+            fire_crs = [r for r in crs if r.fire_metrics is not None]
+            if not fire_crs:
+                continue
+            avg_iou = float(np.mean([r.fire_metrics.iou for r in fire_crs]))
+            avg_ssim = float(np.mean([r.metrics.ssim_val for r in crs]))
+            if avg_iou < iou_threshold:
+                flagged.append((png_name, avg_ssim, avg_iou))
 
-        flagged.sort(key=lambda x: -x[1])
+        flagged.sort(key=lambda x: x[2])  # Ascending IoU (worst first)
         summary.flagged_images = flagged[:20]
         summaries.append(summary)
 
@@ -1720,7 +1764,7 @@ def generate_flagged_heatmaps(
         
         result_map[summary.project] = {}
         
-        for i, (png_name, avg_mae, avg_iou) in enumerate(summary.flagged_images[:max_heatmaps]):
+        for i, (png_name, avg_ssim, avg_iou) in enumerate(summary.flagged_images[:max_heatmaps]):
             cross_results = by_project_png[summary.project][png_name]
             if not cross_results:
                 continue
@@ -1754,7 +1798,6 @@ def generate_flagged_heatmaps(
                 ms_pattern = analyze_scale_pattern(ms_data)
                 ms_metrics = MultiscaleMetrics(
                     scale_factors=ms_data["scale_factors"],
-                    maes=ms_data["maes"],
                     ssims=ms_data["ssims"],
                     dominant_scale=ms_pattern["dominant_scale"],
                     fine_to_coarse_ratio=ms_pattern["fine_to_coarse_ratio"],
@@ -1763,7 +1806,7 @@ def generate_flagged_heatmaps(
 
                 result_map[summary.project][png_name] = FlaggedImageData(
                     png_name=png_name,
-                    avg_mae=avg_mae,
+                    avg_ssim=avg_ssim,
                     avg_iou=avg_iou,
                     diff_heatmap_base64=base64_data,
                     multiscale_analysis=ms_metrics,
@@ -1773,7 +1816,7 @@ def generate_flagged_heatmaps(
                 log.warning(f"Failed to generate heatmap for {png_name}: {e}")
                 result_map[summary.project][png_name] = FlaggedImageData(
                     png_name=png_name,
-                    avg_mae=avg_mae,
+                    avg_ssim=avg_ssim,
                     avg_iou=avg_iou,
                     diff_heatmap_base64=None,
                 )
@@ -1787,20 +1830,29 @@ def generate_flagged_heatmaps(
 
 # --- Console ---
 
+def _verdict_color(v: str) -> str:
+    if v == "FAIL":
+        return _red(v)
+    elif v == "WARN":
+        return _yellow(v)
+    elif v == "PASS":
+        return _green(v)
+    return v
+
+
 def print_console_summary(summaries: list[ProjectSummary],
                           label_a: str, label_b: str):
-    print("\n" + "=" * 160)
-    print("CROSS-GROUP COMPARISON SUMMARY")
-    print("=" * 160)
-    ha = f"Intra-{label_a[:6]}"
-    hb = f"Intra-{label_b[:6]}"
+    print("\n" + "=" * 180)
+    print("CROSS-GROUP COMPARISON SUMMARY  (verdicts driven by fire-category metrics)")
+    print("=" * 180)
     header = (
-        f"{'Project':<35} {'Verdict':<6} {'DevScore':>8} "
-        f"{'Masked MAE':>11} {'Raw MAE':>9} {'Coverage':>8} "
-        f"{'Cross IoU':>10} {'Flagged':>7} {'Temporal':>8}"
+        f"{'Project':<35} {'Verdict':<6} "
+        f"{'FireIoU':>8} {'Drift':>6} {'AreaD%':>7} "
+        f"{'IoU':>4} {'Drft':>4} {'Area':>4} {'Temp':>4} "
+        f"{'SSIM(info)':>11} {'Flagged':>7} {'Temporal':>8}"
     )
     print(header)
-    print("-" * 160)
+    print("-" * 180)
     for s in summaries:
         if s.verdict == "SKIP":
             print(f"{s.project:<35} {'SKIP':<6}")
@@ -1810,45 +1862,41 @@ def print_console_summary(summaries: list[ProjectSummary],
         if s.temporal_violations:
             temporal_str = _yellow(temporal_str)
 
-        verdict_str = s.verdict
-        if s.verdict == "FAIL":
-            verdict_str = _red(s.verdict)
-        elif s.verdict == "WARN":
-            verdict_str = _yellow(s.verdict)
-        else:
-            verdict_str = _green(s.verdict)
-
         print(
-            f"{s.project:<35} {verdict_str:<6} {s.deviation_score:>8.2f} "
-            f"{s.cross_masked_mae_mean:>11.4f} {s.cross_mae_mean:>9.4f} "
-            f"{s.mask_coverage_mean:>8.2f} "
-            f"{s.cross_iou_mean:>10.4f} "
+            f"{s.project:<35} {_verdict_color(s.verdict):<6} "
+            f"{s.fire_cross_iou_mean:>8.4f} {s.fire_cross_drift_mean:>6.1f} "
+            f"{s.fire_cross_area_diff_pct_mean*100:>6.1f}% "
+            f"{_verdict_color(s.iou_verdict):>4} "
+            f"{_verdict_color(s.drift_verdict):>4} "
+            f"{_verdict_color(s.area_diff_verdict):>4} "
+            f"{_verdict_color(s.temporal_verdict):>4} "
+            f"{s.cross_ssim_mean:>11.6f} "
             f"{len(s.flagged_images):>7d} {temporal_str:>8}"
         )
-    print("=" * 160)
+    print("=" * 180)
 
     # Temporal violations detail
     for s in summaries:
         if s.temporal_violations:
             print(f"\n  {_yellow('TEMPORAL VIOLATIONS')} in {s.project}:")
             for v in s.temporal_violations[:5]:
-                print(f"    Run {v.run_name}: t={v.prev_timestep}→{v.timestep}s, "
-                      f"area {v.area_before:.0f}→{v.area_after:.0f} "
+                print(f"    Run {v.run_name}: t={v.prev_timestep}->{v.timestep}s, "
+                      f"area {v.area_before:.0f}->{v.area_after:.0f} "
                       f"({_red(f'-{v.percent_decrease:.1f}%')})")
             if len(s.temporal_violations) > 5:
                 print(f"    ... and {len(s.temporal_violations) - 5} more violations")
 
-    # MAE temporal gradient warnings
+    # SSIM temporal gradient warnings
     for s in summaries:
-        if s.mae_temporal_gradient > 0.01:  # Significant positive trend
-            print(f"\n  {_yellow('MAE ACCUMULATION')} in {s.project}: "
-                  f"gradient = {s.mae_temporal_gradient:.4f} MAE/timestep")
+        if s.ssim_temporal_gradient < -0.0001:
+            print(f"\n  {_yellow('SSIM DEGRADATION')} in {s.project}: "
+                  f"gradient = {s.ssim_temporal_gradient:.6f} SSIM/timestep")
 
     for s in summaries:
-        if s.verdict in ("WARN", "FAIL") and s.flagged_images:
-            print(f"\n  {s.verdict} {s.project}: top flagged images:")
-            for name, mae, iou in s.flagged_images[:10]:
-                print(f"    {name}: avg cross-group MAE = {mae:.4f}, IoU = {iou:.4f}")
+        if s.flagged_images:
+            print(f"\n  {s.project}: top flagged fire images (IoU below threshold):")
+            for name, ssim_val, iou in s.flagged_images[:10]:
+                print(f"    {name}: IoU = {iou:.4f}, SSIM = {ssim_val:.6f}")
 
 
 # --- CSV ---
@@ -1858,13 +1906,13 @@ def write_csv(results: list[ComparisonResult], out_path: Path):
     with open(out_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow([
-            "project", "png_name", "category", "timestep",
+            "project", "png_name", "category", "image_type", "timestep",
             "run_a", "run_b", "pair_type",
-            "mae", "rmse", "psnr", "ssim", "hist_corr",
+            "ssim", "hist_corr",
             "fire_iou", "fire_area_a", "fire_area_b", "fire_area_diff",
             "centroid_drift",
-            "masked_mae", "masked_rmse", "mask_coverage", "rendering_diff",
-            "edge_mae", "edge_correlation", "edge_iou",
+            "masked_ssim", "mask_coverage",
+            "edge_correlation", "edge_iou",
             "boundary_iou", "boundary_length_diff", "hausdorff_approx",
         ])
         for r in results:
@@ -1872,11 +1920,8 @@ def write_csv(results: list[ComparisonResult], out_path: Path):
             mm = r.masked_metrics
             em = r.edge_metrics
             w.writerow([
-                r.project, r.png_name, r.category, r.timestep,
+                r.project, r.png_name, r.category, r.image_type, r.timestep,
                 r.run_a, r.run_b, r.platform_pair,
-                f"{r.metrics.mae:.4f}",
-                f"{r.metrics.rmse:.4f}",
-                f"{r.metrics.psnr:.2f}" if r.metrics.psnr != float("inf") else "inf",
                 f"{r.metrics.ssim_val:.6f}",
                 f"{r.metrics.hist_corr:.6f}",
                 f"{fm.iou:.6f}" if fm else "",
@@ -1884,11 +1929,8 @@ def write_csv(results: list[ComparisonResult], out_path: Path):
                 f"{fm.area_b}" if fm else "",
                 f"{fm.area_diff}" if fm else "",
                 f"{fm.centroid_drift:.2f}" if fm else "",
-                f"{mm.masked_mae:.4f}" if mm else "",
-                f"{mm.masked_rmse:.4f}" if mm else "",
+                f"{mm.masked_ssim:.6f}" if mm else "",
                 f"{mm.mask_coverage:.4f}" if mm else "",
-                f"{mm.rendering_diff:.4f}" if mm else "",
-                f"{em.edge_mae:.4f}" if em else "",
                 f"{em.edge_correlation:.6f}" if em else "",
                 f"{em.edge_iou:.6f}" if em else "",
                 f"{em.boundary_iou:.6f}" if em else "",
@@ -1949,7 +1991,6 @@ td:first-child, th:first-child {{ text-align: left; }}
 .temporal-warning {{ background: #fff3cd; border: 1px solid #ffc107; padding: 10px; border-radius: 4px; margin: 10px 0; }}
 .temporal-warning h4 {{ color: #856404; margin-top: 0; }}
 .gradient-warning {{ background: #f8d7da; border: 1px solid #f5c6cb; padding: 10px; border-radius: 4px; margin: 10px 0; }}
-.new-badge {{ background: #28a745; color: white; font-size: 0.7em; padding: 2px 6px; border-radius: 3px; margin-left: 5px; }}
 </style>
 </head>
 <body>
@@ -1959,70 +2000,49 @@ td:first-child, th:first-child {{ text-align: left; }}
 
 <div class="methodology">
 <h2>Methodology</h2>
-<p>This report compares QUICFire simulation outputs between two groups of runs using image-comparison metrics computed on PlotsFire PNG renderings.</p>
+<p>This report compares QUICFire simulation outputs between two groups of runs.
+Verdicts are driven by <strong>fire-category metrics</strong> (IoU, centroid drift, area diff).
+SSIM is reported for information only.</p>
 
-<h3>Perceptual Metrics</h3>
+<h3>Image Categorization</h3>
 <table>
-<tr><th>Metric</th><th>Description</th></tr>
-<tr><td>MAE</td><td>Mean Absolute Error &mdash; average per-pixel absolute intensity difference. Lower is more similar. Range: [0, 255].</td></tr>
-<tr><td>RMSE</td><td>Root Mean Square Error &mdash; penalises large localised errors. Range: [0, 255].</td></tr>
-<tr><td>PSNR</td><td>Peak Signal-to-Noise Ratio &mdash; 20&middot;log&#8321;&#8320;(255/RMSE). Higher = more similar; &infin; for identical.</td></tr>
-<tr><td>SSIM</td><td>Structural Similarity Index (Wang et al., 2004). Range: [-1, 1]; 1 = identical.</td></tr>
-<tr><td>Histogram Correlation</td><td>Pearson correlation of normalised colour histograms. Range: [-1, 1]; 1 = identical.</td></tr>
+<tr><th>Type</th><th>Categories</th></tr>
+<tr><td>fire</td><td><code>perc_mass_burnt</code>, <code>bw_perc_mass_burnt</code>, <code>fuel_dens_Plane</code>, <code>wplume_Plane</code></td></tr>
+<tr><td>wind</td><td><code>u_qu_*</code>, <code>v_qu_*</code>, <code>w_qu_*</code></td></tr>
+<tr><td>emissions</td><td><code>co_emissions</code>, <code>pm_emissions</code></td></tr>
+<tr><td>other</td><td>Everything else</td></tr>
 </table>
 
-<h3>Fire Region Metrics <span class="new-badge">NEW</span></h3>
+<h3>Fire-Metric Verdict Thresholds</h3>
 <table>
-<tr><th>Metric</th><th>Description</th></tr>
-<tr><td>Fire IoU</td><td>Intersection over Union of segmented fire regions. More sensitive to fire-front boundary errors than whole-image metrics.</td></tr>
-<tr><td>Fire Area Diff</td><td>Absolute difference in fire pixel count between images.</td></tr>
-<tr><td>Centroid Drift</td><td>Euclidean distance between fire region centroids (in pixels).</td></tr>
+<tr><th>Criterion</th><th>PASS</th><th>WARN</th><th>FAIL</th></tr>
+<tr><td>Fire IoU</td><td>&ge; 0.95</td><td>&ge; 0.85</td><td>&lt; 0.85</td></tr>
+<tr><td>Centroid Drift (px)</td><td>&le; 5.0</td><td>&le; 10.0</td><td>&gt; 10.0</td></tr>
+<tr><td>Area Diff %</td><td>&le; 5%</td><td>&le; 15%</td><td>&gt; 15%</td></tr>
+<tr><td>Temporal</td><td>No violations</td><td>Violations</td><td>&mdash;</td></tr>
 </table>
+<p>Overall verdict = worst of sub-verdicts. If no fire images exist, verdict = SKIP.</p>
 
 <h3>Comparison Design</h3>
 <p><strong>Intra-{_esc(label_a)}</strong> &mdash; pairs within {_esc(label_a)} (run-to-run variability).<br>
 <strong>Intra-{_esc(label_b)}</strong> &mdash; pairs within {_esc(label_b)}.<br>
 <strong>Cross</strong> &mdash; one run from each group.</p>
 
-<h3>Deviation Score</h3>
-<p>z-score: (cross_MAE_mean &minus; intra_MAE_mean) / intra_MAE_std.<br>
-<strong>PASS</strong> &le; &sigma;, <strong>WARN</strong> &le; 2&sigma;, <strong>FAIL</strong> &gt; 2&sigma;.</p>
-
-<h3>Temporal Monotonicity <span class="new-badge">NEW</span></h3>
+<h3>Temporal Monotonicity</h3>
 <p>Fire area should not decrease significantly over time. Violations may indicate numerical instability or integration bugs.</p>
 
-<h3>Rendering Region Masking <span class="new-badge">NEW</span></h3>
-<p>To isolate simulation differences from cross-platform rendering artifacts,
-metrics are computed with the following regions masked out:</p>
-<ul>
-<li><strong>Plot borders</strong>: Title, axis labels, and colorbar regions
-    (where font rendering differs between macOS/Linux)</li>
-<li><strong>Fire boundaries</strong>: Anti-aliased edge pixels
-    (where sub-pixel rendering differs)</li>
-</ul>
-<p>Both masked and unmasked metrics are reported for transparency.
-The deviation score and verdict use <strong>masked metrics</strong> by default.</p>
-
-<h3>Edge &amp; Boundary Metrics <span class="new-badge">NEW</span></h3>
-<table>
-<tr><th>Metric</th><th>Description</th></tr>
-<tr><td>Edge MAE</td><td>Mean absolute difference of Sobel edge magnitudes.</td></tr>
-<tr><td>Edge Correlation</td><td>Pearson correlation of edge maps. 1 = identical structure.</td></tr>
-<tr><td>Boundary IoU</td><td>Overlap of fire-front boundary pixels.</td></tr>
-<tr><td>Hausdorff (approx)</td><td>Maximum distance from any boundary pixel in A to nearest in B.</td></tr>
-</table>
-
-<h3>Difference Heatmaps <span class="new-badge">NEW</span></h3>
+<h3>Difference Heatmaps</h3>
 <p>For flagged images, pixel-wise difference heatmaps show where images differ most. Color scale: black (no difference) &rarr; red &rarr; yellow &rarr; white (maximum difference).</p>
 </div>
 
 <h2>Summary</h2>
 <table>
 <tr>
-  <th>Project</th><th>Verdict</th><th>Deviation Score</th>
-  <th>Masked MAE</th><th>Raw MAE</th><th>Coverage</th>
-  <th>Cross SSIM</th><th>Cross IoU</th><th>Boundary IoU</th>
-  <th># Flagged</th><th>Temporal</th><th># Comparisons</th>
+  <th>Project</th><th>Verdict</th>
+  <th>Fire IoU</th><th>Drift (px)</th><th>AreaDiff%</th>
+  <th>IoU</th><th>Drift</th><th>Area</th><th>Temp</th>
+  <th>SSIM (info)</th>
+  <th># Flagged</th><th># Comparisons</th>
 </tr>
 """)
 
@@ -2031,22 +2051,21 @@ The deviation score and verdict use <strong>masked metrics</strong> by default.<
         if s.verdict == "SKIP":
             parts.append(f'<tr><td>{_esc(s.project)}</td>'
                          f'<td class="skip">SKIP</td>'
-                         f'<td colspan="11">No PNGs</td></tr>\n')
+                         f'<td colspan="10">No PNGs</td></tr>\n')
             continue
 
-        temporal_cell = "OK" if not s.temporal_violations else f'<span class="warn">{len(s.temporal_violations)}</span>'
         parts.append(
             f'<tr><td><a href="#{_esc(s.project)}">{_esc(s.project)}</a></td>'
             f'<td class="{vc}">{s.verdict}</td>'
-            f'<td>{s.deviation_score:.2f}</td>'
-            f'<td>{s.cross_masked_mae_mean:.4f} <small>({s.cross_mae_mean:.4f})</small></td>'
-            f'<td>{s.cross_mae_mean:.4f}</td>'
-            f'<td>{s.mask_coverage_mean:.2f}</td>'
+            f'<td>{s.fire_cross_iou_mean:.4f}</td>'
+            f'<td>{s.fire_cross_drift_mean:.1f}</td>'
+            f'<td>{s.fire_cross_area_diff_pct_mean*100:.1f}%</td>'
+            f'<td class="{s.iou_verdict.lower()}">{s.iou_verdict}</td>'
+            f'<td class="{s.drift_verdict.lower()}">{s.drift_verdict}</td>'
+            f'<td class="{s.area_diff_verdict.lower()}">{s.area_diff_verdict}</td>'
+            f'<td class="{s.temporal_verdict.lower()}">{s.temporal_verdict}</td>'
             f'<td>{s.cross_ssim_mean:.6f}</td>'
-            f'<td>{s.cross_iou_mean:.4f}</td>'
-            f'<td>{s.cross_boundary_iou_mean:.4f}</td>'
             f'<td>{len(s.flagged_images)}</td>'
-            f'<td>{temporal_cell}</td>'
             f'<td>{s.n_comparisons}</td></tr>\n'
         )
 
@@ -2062,9 +2081,9 @@ The deviation score and verdict use <strong>masked metrics</strong> by default.<
         parts.append(f'<h3>{_esc(s.project)} — '
                      f'<span class="{s.verdict.lower()}">{s.verdict}</span></h3>\n')
         parts.append(f'<p>Images: {s.n_images} | Comparisons: {s.n_comparisons} | '
-                     f'Deviation Score: {s.deviation_score:.2f}</p>\n')
+                     f'Fire comparisons: {s.fire_n_cross_comparisons}</p>\n')
 
-        # Temporal violations warning (NEW)
+        # Temporal violations warning
         if s.temporal_violations:
             parts.append('<div class="temporal-warning">\n')
             parts.append(f'<h4>⚠️ Temporal Monotonicity Violations ({len(s.temporal_violations)} detected)</h4>\n')
@@ -2081,11 +2100,11 @@ The deviation score and verdict use <strong>masked metrics</strong> by default.<
                 parts.append(f'<p>... and {len(s.temporal_violations) - 10} more violations</p>\n')
             parts.append('</div>\n')
 
-        # MAE gradient warning (NEW)
-        if s.mae_temporal_gradient > 0.01:
+        # SSIM gradient warning
+        if s.ssim_temporal_gradient < -0.0001:
             parts.append('<div class="gradient-warning">\n')
-            parts.append(f'<h4>⚠️ Error Accumulation Detected</h4>\n')
-            parts.append(f'<p>MAE increases over time (gradient: {s.mae_temporal_gradient:.4f} MAE/timestep). '
+            parts.append(f'<h4>⚠️ Similarity Degradation Detected</h4>\n')
+            parts.append(f'<p>SSIM decreases over time (gradient: {s.ssim_temporal_gradient:.6f} SSIM/timestep). '
                          f'This may indicate numerical integration bugs that compound over simulation time.</p>\n')
             parts.append('</div>\n')
 
@@ -2096,71 +2115,60 @@ The deviation score and verdict use <strong>masked metrics</strong> by default.<
             parts.append(f'<h4>⚠️ Exponential Error Growth Detected</h4>\n')
             parts.append(f'<p>Errors grow exponentially (rate: {tga.exponential_rate:.4f}). '
                          f'R&sup2; = {tga.exponential_r_squared:.3f}</p>\n')
-            parts.append(f'<p>Phase MAE: Early={tga.early_phase_mae:.4f}, '
-                         f'Mid={tga.mid_phase_mae:.4f}, '
-                         f'Late={tga.late_phase_mae:.4f}</p>\n')
+            parts.append(f'<p>Phase SSIM: Early={tga.early_phase_ssim:.6f}, '
+                         f'Mid={tga.mid_phase_ssim:.6f}, '
+                         f'Late={tga.late_phase_ssim:.6f}</p>\n')
             parts.append('</div>\n')
 
         parts.append(f"""<table>
-<tr><th>Metric</th><th>Intra-{_esc(label_a)} Mean</th><th>Intra-{_esc(label_b)} Mean</th><th>Cross Mean</th></tr>
+<tr><th>Metric</th><th>Value</th><th>Verdict</th></tr>
 """)
-        parts.append(f'<tr><td>MAE</td><td>{s.intra_a_mae_mean:.4f} '
-                     f'(&plusmn;{s.intra_a_mae_std:.4f})</td>'
-                     f'<td>{s.intra_b_mae_mean:.4f} '
-                     f'(&plusmn;{s.intra_b_mae_std:.4f})</td>'
-                     f'<td>{s.cross_mae_mean:.4f} '
-                     f'(&plusmn;{s.cross_mae_std:.4f})</td></tr>\n')
-        parts.append(f'<tr><td>RMSE</td><td>{s.intra_a_rmse_mean:.4f}</td>'
-                     f'<td>{s.intra_b_rmse_mean:.4f}</td>'
-                     f'<td>{s.cross_rmse_mean:.4f}</td></tr>\n')
-        parts.append(f'<tr><td>SSIM</td>'
-                     f'<td>{s.intra_a_ssim_mean:.6f}</td>'
-                     f'<td>{s.intra_b_ssim_mean:.6f}</td>'
-                     f'<td>{s.cross_ssim_mean:.6f}</td></tr>\n')
-        parts.append(f'<tr><td>Fire IoU</td>'
-                     f'<td>{s.intra_iou_mean:.4f}</td>'
-                     f'<td>{s.intra_iou_mean:.4f}</td>'
-                     f'<td>{s.cross_iou_mean:.4f} (&plusmn;{s.cross_iou_std:.4f})</td></tr>\n')
-        parts.append(f'<tr><td>Centroid Drift (px)</td>'
-                     f'<td>&mdash;</td><td>&mdash;</td>'
-                     f'<td>{s.cross_centroid_drift_mean:.2f}</td></tr>\n')
-        parts.append(f'<tr><td>Masked MAE</td>'
-                     f'<td>&mdash;</td><td>&mdash;</td>'
-                     f'<td>{s.cross_masked_mae_mean:.4f} (coverage: {s.mask_coverage_mean:.2f})</td></tr>\n')
-        parts.append(f'<tr><td>Edge MAE</td>'
-                     f'<td>&mdash;</td><td>&mdash;</td>'
-                     f'<td>{s.cross_edge_mae_mean:.4f}</td></tr>\n')
-        parts.append(f'<tr><td>Boundary IoU</td>'
-                     f'<td>&mdash;</td><td>&mdash;</td>'
-                     f'<td>{s.cross_boundary_iou_mean:.4f}</td></tr>\n')
-        parts.append(f'<tr><td>Hausdorff (approx px)</td>'
-                     f'<td>&mdash;</td><td>&mdash;</td>'
-                     f'<td>{s.cross_hausdorff_mean:.1f}</td></tr>\n')
+        parts.append(f'<tr><td><strong>Fire IoU (cross, fire-category)</strong></td>'
+                     f'<td>{s.fire_cross_iou_mean:.4f} (&plusmn;{s.fire_cross_iou_std:.4f})</td>'
+                     f'<td class="{s.iou_verdict.lower()}">{s.iou_verdict}</td></tr>\n')
+        parts.append(f'<tr><td><strong>Centroid Drift (cross, fire-category)</strong></td>'
+                     f'<td>{s.fire_cross_drift_mean:.2f} px (&plusmn;{s.fire_cross_drift_std:.2f})</td>'
+                     f'<td class="{s.drift_verdict.lower()}">{s.drift_verdict}</td></tr>\n')
+        parts.append(f'<tr><td><strong>Area Diff % (cross, fire-category)</strong></td>'
+                     f'<td>{s.fire_cross_area_diff_pct_mean*100:.1f}% (&plusmn;{s.fire_cross_area_diff_pct_std*100:.1f}%)</td>'
+                     f'<td class="{s.area_diff_verdict.lower()}">{s.area_diff_verdict}</td></tr>\n')
+        parts.append(f'<tr><td><strong>Temporal</strong></td>'
+                     f'<td>{len(s.temporal_violations)} violations</td>'
+                     f'<td class="{s.temporal_verdict.lower()}">{s.temporal_verdict}</td></tr>\n')
+        parts.append(f'<tr><td>SSIM (all, informational)</td>'
+                     f'<td>{s.cross_ssim_mean:.6f} (&plusmn;{s.cross_ssim_std:.6f})</td>'
+                     f'<td>&mdash;</td></tr>\n')
+        parts.append(f'<tr><td>Fire IoU (all cross)</td>'
+                     f'<td>{s.cross_iou_mean:.4f} (&plusmn;{s.cross_iou_std:.4f})</td>'
+                     f'<td>&mdash;</td></tr>\n')
+        parts.append(f'<tr><td>Masked SSIM (informational)</td>'
+                     f'<td>{s.cross_masked_ssim_mean:.6f} (coverage: {s.mask_coverage_mean:.2f})</td>'
+                     f'<td>&mdash;</td></tr>\n')
         parts.append("</table>\n")
 
         # Time-series
         cross_rs = [r for r in rs if r.platform_pair == "cross" and r.timestep >= 0]
         if cross_rs:
-            ts_mae = defaultdict(list)
+            ts_ssim = defaultdict(list)
             ts_iou = defaultdict(list)
             for r in cross_rs:
-                ts_mae[r.timestep].append(r.metrics.mae)
+                ts_ssim[r.timestep].append(r.metrics.ssim_val)
                 if r.fire_metrics:
                     ts_iou[r.timestep].append(r.fire_metrics.iou)
-            sorted_ts = sorted(ts_mae.keys())
+            sorted_ts = sorted(ts_ssim.keys())
             if len(sorted_ts) > 1:
                 parts.append("<h4>Cross-Group Metrics Over Time</h4>\n")
-                parts.append("<table><tr><th>Timestep (s)</th><th>Avg MAE</th>"
-                             "<th>Max MAE</th><th>Avg IoU</th><th>Visual</th></tr>\n")
-                max_overall = max(np.mean(ts_mae[t]) for t in sorted_ts)
+                parts.append("<table><tr><th>Timestep (s)</th><th>Avg SSIM</th>"
+                             "<th>Min SSIM</th><th>Avg IoU</th><th>Visual</th></tr>\n")
+                min_overall = min(np.mean(ts_ssim[t]) for t in sorted_ts)
                 for t in sorted_ts:
-                    vals = ts_mae[t]
+                    vals = ts_ssim[t]
                     avg = np.mean(vals)
-                    mx = max(vals)
+                    mn = min(vals)
                     avg_iou = np.mean(ts_iou.get(t, [1.0]))
-                    bar_w = int(200 * avg / max(max_overall, 0.01))
+                    bar_w = int(200 * avg) if avg > 0 else 0
                     parts.append(
-                        f'<tr><td>{t}</td><td>{avg:.4f}</td><td>{mx:.4f}</td>'
+                        f'<tr><td>{t}</td><td>{avg:.6f}</td><td>{mn:.6f}</td>'
                         f'<td>{avg_iou:.4f}</td>'
                         f'<td><span class="metric-bar" style="width:{bar_w}px">'
                         f'</span></td></tr>\n'
@@ -2169,14 +2177,14 @@ The deviation score and verdict use <strong>masked metrics</strong> by default.<
 
         # Flagged images with heatmaps (ENHANCED)
         if s.flagged_images:
-            parts.append("<h4>Flagged Images (Cross-Group MAE above threshold)</h4>\n")
+            parts.append("<h4>Flagged Images (Fire IoU below threshold)</h4>\n")
             parts.append('<table class="flagged-table">'
-                         '<tr><th>Image</th><th>Avg MAE</th><th>Avg IoU</th>'
+                         '<tr><th>Image</th><th>Avg SSIM</th><th>Avg IoU</th>'
                          '<th>Scale Analysis</th><th>Heatmap</th></tr>\n')
 
             project_heatmaps = heatmap_data.get(s.project, {}) if heatmap_data else {}
 
-            for name, mae, iou in s.flagged_images:
+            for name, ssim_val, iou in s.flagged_images:
                 heatmap_cell = ""
                 scale_cell = ""
                 if name in project_heatmaps:
@@ -2199,7 +2207,7 @@ The deviation score and verdict use <strong>masked metrics</strong> by default.<
                                       f'<small>Ratio: {ma.fine_to_coarse_ratio:.2f}</small>')
 
                 parts.append(f'<tr><td>{_esc(name)}</td>'
-                             f'<td>{mae:.4f}</td>'
+                             f'<td>{ssim_val:.6f}</td>'
                              f'<td>{iou:.4f}</td>'
                              f'<td>{scale_cell}</td>'
                              f'<td>{heatmap_cell}</td></tr>\n')
@@ -2209,26 +2217,21 @@ The deviation score and verdict use <strong>masked metrics</strong> by default.<
         categories = sorted({r.category for r in rs})
         if len(categories) > 1:
             parts.append("<h4>Per-Category Summary</h4>\n")
-            parts.append("<table><tr><th>Category</th>"
-                         "<th>Intra MAE</th><th>Cross MAE</th>"
-                         "<th>Cross SSIM</th><th>Cross IoU</th></tr>\n")
+            parts.append("<table><tr><th>Category</th><th>Type</th>"
+                         "<th>Cross SSIM</th>"
+                         "<th>Cross IoU</th></tr>\n")
             for cat in categories:
                 cat_rs = [r for r in rs if r.category == cat]
-                intra = [r.metrics.mae for r in cat_rs
-                         if r.platform_pair in ("intra_a", "intra_b")]
-                cross_cat = [r.metrics.mae for r in cat_rs
-                             if r.platform_pair == "cross"]
+                img_type = cat_rs[0].image_type if cat_rs else "other"
                 cross_s = [r.metrics.ssim_val for r in cat_rs
                            if r.platform_pair == "cross" and r.metrics.ssim_val >= 0]
                 cross_iou = [r.fire_metrics.iou for r in cat_rs
                              if r.platform_pair == "cross" and r.fire_metrics]
-                i_m = np.mean(intra) if intra else 0.0
-                c_m = np.mean(cross_cat) if cross_cat else 0.0
                 cs_m = np.mean(cross_s) if cross_s else 0.0
                 ci_m = np.mean(cross_iou) if cross_iou else 0.0
                 parts.append(
-                    f'<tr><td>{_esc(cat)}</td><td>{i_m:.4f}</td>'
-                    f'<td>{c_m:.4f}</td><td>{cs_m:.6f}</td>'
+                    f'<tr><td>{_esc(cat)}</td><td>{_esc(img_type)}</td>'
+                    f'<td>{cs_m:.6f}</td>'
                     f'<td>{ci_m:.4f}</td></tr>\n'
                 )
             parts.append("</table>\n")
@@ -2266,19 +2269,19 @@ def write_markdown_report(
 
     # Summary table
     lines.append("## Summary\n")
-    lines.append(f"| Project | Verdict | Dev Score | Intra-{label_a} MAE | "
-                 f"Intra-{label_b} MAE | Cross MAE | Cross SSIM | Cross IoU | Flagged | Temporal | Comparisons |")
-    lines.append("|---------|---------|-----------|" + "------------|" * 8)
+    lines.append(f"| Project | Verdict | Fire IoU | Drift (px) | AreaDiff% | "
+                 f"IoU | Drift | Area | Temp | SSIM (info) | Flagged | Comparisons |")
+    lines.append("|---------|---------|----------|------------|-----------|" + "-----|" * 4 + "-------------|---------|-------------|")
     for s in summaries:
         if s.verdict == "SKIP":
-            lines.append(f"| {s.project} | SKIP | | | | | | | | | |")
+            lines.append(f"| {s.project} | SKIP | | | | | | | | | | |")
             continue
-        temporal_str = "OK" if not s.temporal_violations else f"⚠️ {len(s.temporal_violations)}"
         lines.append(
-            f"| {s.project} | **{s.verdict}** | {s.deviation_score:.2f} | "
-            f"{s.intra_a_mae_mean:.4f} | {s.intra_b_mae_mean:.4f} | "
-            f"{s.cross_mae_mean:.4f} | {s.cross_ssim_mean:.6f} | "
-            f"{s.cross_iou_mean:.4f} | {len(s.flagged_images)} | {temporal_str} | {s.n_comparisons} |"
+            f"| {s.project} | **{s.verdict}** | "
+            f"{s.fire_cross_iou_mean:.4f} | {s.fire_cross_drift_mean:.1f} | "
+            f"{s.fire_cross_area_diff_pct_mean*100:.1f}% | "
+            f"{s.iou_verdict} | {s.drift_verdict} | {s.area_diff_verdict} | {s.temporal_verdict} | "
+            f"{s.cross_ssim_mean:.6f} | {len(s.flagged_images)} | {s.n_comparisons} |"
         )
     lines.append("")
 
@@ -2290,66 +2293,62 @@ def write_markdown_report(
         rs = by_project.get(s.project, [])
         lines.append(f"### {s.project} — {s.verdict}\n")
         lines.append(f"Images: {s.n_images} | Comparisons: {s.n_comparisons} | "
-                     f"Deviation Score: {s.deviation_score:.2f}\n")
+                     f"Fire comparisons: {s.fire_n_cross_comparisons}\n")
 
-        # Temporal violations (NEW)
+        # Temporal violations
         if s.temporal_violations:
-            lines.append("#### ⚠️ Temporal Monotonicity Violations\n")
+            lines.append("#### Temporal Monotonicity Violations\n")
             lines.append("| Run | Timestep | Area Before | Area After | Decrease |")
             lines.append("|-----|----------|-------------|------------|----------|")
             for v in s.temporal_violations[:10]:
-                lines.append(f"| {v.run_name} | {v.prev_timestep}→{v.timestep}s | "
+                lines.append(f"| {v.run_name} | {v.prev_timestep}->{v.timestep}s | "
                              f"{v.area_before:.0f} | {v.area_after:.0f} | -{v.percent_decrease:.1f}% |")
             lines.append("")
 
-        # MAE gradient warning (NEW)
-        if s.mae_temporal_gradient > 0.01:
-            lines.append(f"#### ⚠️ Error Accumulation\n")
-            lines.append(f"MAE gradient: {s.mae_temporal_gradient:.4f} MAE/timestep\n")
+        # SSIM gradient warning
+        if s.ssim_temporal_gradient < -0.0001:
+            lines.append(f"#### Similarity Degradation\n")
+            lines.append(f"SSIM gradient: {s.ssim_temporal_gradient:.6f} SSIM/timestep\n")
 
-        lines.append(f"| Metric | Intra-{label_a} Mean | Intra-{label_b} Mean | Cross Mean |")
-        lines.append("|--------|------------|------------|------------|")
-        lines.append(f"| MAE | {s.intra_a_mae_mean:.4f} (+/-{s.intra_a_mae_std:.4f}) | "
-                     f"{s.intra_b_mae_mean:.4f} (+/-{s.intra_b_mae_std:.4f}) | "
-                     f"{s.cross_mae_mean:.4f} (+/-{s.cross_mae_std:.4f}) |")
-        lines.append(f"| RMSE | {s.intra_a_rmse_mean:.4f} | "
-                     f"{s.intra_b_rmse_mean:.4f} | {s.cross_rmse_mean:.4f} |")
-        lines.append(f"| SSIM | {s.intra_a_ssim_mean:.6f} | "
-                     f"{s.intra_b_ssim_mean:.6f} | {s.cross_ssim_mean:.6f} |")
-        lines.append(f"| Fire IoU | {s.intra_iou_mean:.4f} | "
-                     f"{s.intra_iou_mean:.4f} | {s.cross_iou_mean:.4f} |")
-        lines.append(f"| Centroid Drift | — | — | {s.cross_centroid_drift_mean:.2f} px |")
+        lines.append("| Metric | Value | Verdict |")
+        lines.append("|--------|-------|---------|")
+        lines.append(f"| **Fire IoU (fire-category)** | {s.fire_cross_iou_mean:.4f} (+/-{s.fire_cross_iou_std:.4f}) | {s.iou_verdict} |")
+        lines.append(f"| **Centroid Drift (fire-category)** | {s.fire_cross_drift_mean:.2f} px (+/-{s.fire_cross_drift_std:.2f}) | {s.drift_verdict} |")
+        lines.append(f"| **Area Diff % (fire-category)** | {s.fire_cross_area_diff_pct_mean*100:.1f}% (+/-{s.fire_cross_area_diff_pct_std*100:.1f}%) | {s.area_diff_verdict} |")
+        lines.append(f"| **Temporal** | {len(s.temporal_violations)} violations | {s.temporal_verdict} |")
+        lines.append(f"| SSIM (all, info) | {s.cross_ssim_mean:.6f} (+/-{s.cross_ssim_std:.6f}) | -- |")
+        lines.append(f"| Fire IoU (all cross) | {s.cross_iou_mean:.4f} (+/-{s.cross_iou_std:.4f}) | -- |")
         lines.append("")
 
         # Time-series
         cross_rs = [r for r in rs if r.platform_pair == "cross" and r.timestep >= 0]
         if cross_rs:
-            ts_mae = defaultdict(list)
+            ts_ssim = defaultdict(list)
             ts_iou = defaultdict(list)
             for r in cross_rs:
-                ts_mae[r.timestep].append(r.metrics.mae)
+                ts_ssim[r.timestep].append(r.metrics.ssim_val)
                 if r.fire_metrics:
                     ts_iou[r.timestep].append(r.fire_metrics.iou)
-            sorted_ts = sorted(ts_mae.keys())
+            sorted_ts = sorted(ts_ssim.keys())
             if len(sorted_ts) > 1:
                 lines.append("#### Cross-Group Metrics Over Time\n")
-                lines.append("| Timestep (s) | Avg MAE | Max MAE | Avg IoU |")
-                lines.append("|-------------|---------|---------|---------|")
+                lines.append("| Timestep (s) | Avg SSIM | Min SSIM | Avg IoU |")
+                lines.append("|-------------|----------|----------|---------|")
                 for t in sorted_ts:
-                    vals = ts_mae[t]
+                    vals = ts_ssim[t]
                     avg = np.mean(vals)
-                    mx = max(vals)
+                    mn = min(vals)
                     avg_iou = np.mean(ts_iou.get(t, [1.0]))
-                    lines.append(f"| {t} | {avg:.4f} | {mx:.4f} | {avg_iou:.4f} |")
+                    lines.append(f"| {t} | {avg:.6f} | {mn:.6f} | {avg_iou:.4f} |")
                 lines.append("")
 
         # Flagged images
         if s.flagged_images:
-            lines.append("#### Flagged Images\n")
-            lines.append("| Image | Avg MAE | Avg IoU |")
-            lines.append("|-------|---------|---------|")
-            for name, mae, iou in s.flagged_images:
-                lines.append(f"| {name} | {mae:.4f} | {iou:.4f} |")
+            lines.append("#### Flagged Images (Fire IoU below threshold)\n")
+            lines.append("| Image | Avg IoU | Avg SSIM |")
+            lines.append("|-------|---------|----------|")
+            for name, ssim_val, iou in s.flagged_images:
+                lines.append(f"| {name} | {iou:.4f} | {ssim_val:.6f} |")
             lines.append("")
 
     with open(out_path, "w") as f:
@@ -2389,7 +2388,7 @@ def run_check_setup(
     print("  ✓ Difference heatmaps for flagged images")
     print("  ✓ Fire region segmentation and IoU metrics")
     print("  ✓ Temporal monotonicity violation detection")
-    print("  ✓ MAE temporal gradient analysis")
+    print("  ✓ SSIM temporal gradient analysis")
     print("  ✓ Rendering-region masking (border/colorbar/title)")
     print("  ✓ Interior-only comparison (anti-aliased boundary erosion)")
     print("  ✓ Edge & boundary comparison (Sobel, Hausdorff)")
@@ -2546,7 +2545,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path, default=Path.cwd(),
                         help="Directory for output files (default: cwd)")
     parser.add_argument("--sigma", type=float, default=DEFAULT_SIGMA_THRESHOLD,
-                        help=f"Deviation threshold in sigma (default: {DEFAULT_SIGMA_THRESHOLD})")
+                        help=f"SSIM deviation threshold in sigma, informational only (default: {DEFAULT_SIGMA_THRESHOLD})")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
                         help=f"GPU batch size (default: {DEFAULT_BATCH_SIZE})")
     parser.add_argument("--io-workers", type=int, default=8,
@@ -2587,6 +2586,21 @@ def build_parser() -> argparse.ArgumentParser:
     scale_group = parser.add_argument_group("multi-scale analysis options")
     scale_group.add_argument("--multiscale-levels", type=int, default=4,
                              help="Number of pyramid levels for multi-scale analysis (default: 4)")
+
+    # Fire-metric verdict thresholds
+    verdict_group = parser.add_argument_group("fire-metric verdict thresholds")
+    verdict_group.add_argument("--iou-threshold", type=float, default=DEFAULT_IOU_PASS,
+                               help=f"IoU PASS threshold (default: {DEFAULT_IOU_PASS})")
+    verdict_group.add_argument("--iou-warn", type=float, default=DEFAULT_IOU_WARN,
+                               help=f"IoU WARN threshold (default: {DEFAULT_IOU_WARN})")
+    verdict_group.add_argument("--drift-threshold", type=float, default=DEFAULT_DRIFT_PASS,
+                               help=f"Centroid drift PASS threshold in pixels (default: {DEFAULT_DRIFT_PASS})")
+    verdict_group.add_argument("--drift-warn", type=float, default=DEFAULT_DRIFT_WARN,
+                               help=f"Centroid drift WARN threshold in pixels (default: {DEFAULT_DRIFT_WARN})")
+    verdict_group.add_argument("--area-diff-threshold", type=float, default=DEFAULT_AREA_DIFF_PASS,
+                               help=f"Area diff PASS threshold as fraction (default: {DEFAULT_AREA_DIFF_PASS})")
+    verdict_group.add_argument("--area-diff-warn", type=float, default=DEFAULT_AREA_DIFF_WARN,
+                               help=f"Area diff WARN threshold as fraction (default: {DEFAULT_AREA_DIFF_WARN})")
 
     return parser
 
@@ -2695,6 +2709,8 @@ def main():
     log.info(f"Mask rendering: {not args.no_mask_rendering}")
     log.info(f"Mask boundaries: {not args.no_mask_boundaries}")
     log.info(f"Edge metrics: {not args.no_edge_metrics}")
+    log.info(f"Verdict thresholds: IoU>={args.iou_threshold}, "
+             f"drift<={args.drift_threshold}px, area_diff<={args.area_diff_threshold*100:.0f}%")
 
     # --- Process (pipelined: GPU batch N+1 overlaps with CPU metrics for batch N) ---
     log.info(f"Running {len(tasks)} comparisons in batches of {batch_size}...")
@@ -2720,13 +2736,13 @@ def main():
     ):
         # Pipeline state: previous batch's pending CPU work
         prev_pending: tuple | None = None
-        # prev_pending = (cpu_futures_list, batch_tasks, mae, rmse, psnr, ssim, hist)
+        # prev_pending = (cpu_futures_list, batch_tasks, ssim, hist)
 
         def _collect_pending(pending):
             """Block until previous batch's CPU metrics finish, assemble results."""
-            futures, btasks, mae_c, rmse_c, psnr_c, ssim_c, hist_c = pending
+            futures, btasks, ssim_c, hist_c = pending
             cpu_metrics = [f.result() for f in futures]
-            return _assemble_results(btasks, mae_c, rmse_c, psnr_c, ssim_c, hist_c, cpu_metrics)
+            return _assemble_results(btasks, ssim_c, hist_c, cpu_metrics)
 
         for batch_idx in range(n_batches):
             start = batch_idx * batch_size
@@ -2754,16 +2770,16 @@ def main():
 
             # Submit current batch's CPU work as individual futures (one per pair)
             # Each runs in its own thread — numpy/scipy release the GIL
-            mae_cpu, rmse_cpu, psnr_cpu, ssim_cpu, hist_cpu, raw_pairs = gpu_arrays
+            ssim_cpu, hist_cpu, raw_pairs = gpu_arrays
             cpu_futures = [
                 cpu_pool.submit(
                     _compute_pair_cpu_metrics,
-                    (arr_a, arr_b, mae_cpu[i], rmse_cpu[i]) + cpu_shared,
+                    (arr_a, arr_b) + cpu_shared,
                 )
                 for i, (arr_a, arr_b) in enumerate(raw_pairs)
             ]
             prev_pending = (cpu_futures, batch_tasks_cur,
-                            mae_cpu, rmse_cpu, psnr_cpu, ssim_cpu, hist_cpu)
+                            ssim_cpu, hist_cpu)
 
             if (batch_idx + 1) % 10 == 0 or batch_idx == n_batches - 1:
                 elapsed = time.time() - t0
@@ -2787,9 +2803,15 @@ def main():
     summaries = analyze_results(
         all_results, project_names, args.sigma,
         use_masked=not args.no_mask_rendering,
+        iou_threshold=args.iou_threshold,
+        iou_warn_threshold=args.iou_warn,
+        drift_threshold=args.drift_threshold,
+        drift_warn_threshold=args.drift_warn,
+        area_diff_threshold=args.area_diff_threshold,
+        area_diff_warn_threshold=args.area_diff_warn,
     )
 
-    # --- Generate heatmaps for flagged images (NEW) ---
+    # --- Generate heatmaps for flagged images ---
     heatmap_data = None
     if "html" in output_formats and not args.no_heatmaps:
         log.info("Generating difference heatmaps for flagged images...")

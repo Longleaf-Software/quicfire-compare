@@ -1,8 +1,8 @@
 # qf-compare
 
-QUIC-Fire simulation output comparison tool (v2.1). Compares project PNG outputs between any two groups of runs using GPU-accelerated image metrics, then generates multi-format reports with statistical pass/warn/fail verdicts.
+QUIC-Fire simulation output comparison tool (v3.0). Compares project PNG outputs between any two groups of runs using GPU-accelerated image metrics, then generates multi-format reports with fire-metric-based pass/warn/fail verdicts.
 
-v2.1 adds rendering-region masking, edge/boundary comparison, multi-scale error analysis, and detailed temporal gradient analysis to isolate genuine simulation differences from cross-platform rendering artifacts.
+v3.0 replaces SSIM-based z-score verdicts with **absolute fire-metric thresholds** (IoU, centroid drift, area diff). SSIM is retained as informational. Images are classified by type (fire/wind/emissions/other); only fire-category images drive verdicts.
 
 ---
 
@@ -49,8 +49,12 @@ usage: qf-compare [-h] [--group-a DIR] [--group-b DIR] [--project-a DIR]
                   [--border-left BORDER_LEFT] [--border-right BORDER_RIGHT]
                   [--erode-boundary ERODE_BOUNDARY] [--no-edge-metrics]
                   [--multiscale-levels MULTISCALE_LEVELS]
+                  [--iou-threshold IOU_THRESHOLD] [--iou-warn IOU_WARN]
+                  [--drift-threshold DRIFT_THRESHOLD] [--drift-warn DRIFT_WARN]
+                  [--area-diff-threshold AREA_DIFF_THRESHOLD]
+                  [--area-diff-warn AREA_DIFF_WARN]
 
-General-purpose QUICFire simulation output comparison tool (GPU-accelerated, enhanced v2.1)
+General-purpose QUICFire simulation output comparison tool (GPU-accelerated, v3.0)
 
 options:
   -h, --help            show this help message and exit
@@ -59,7 +63,8 @@ options:
                         (default: html)
   --output-dir OUTPUT_DIR
                         Directory for output files (default: cwd)
-  --sigma SIGMA         Deviation threshold in sigma (default: 2.0)
+  --sigma SIGMA         SSIM deviation threshold in sigma, informational only
+                        (default: 2.0)
   --batch-size BATCH_SIZE
                         GPU batch size (default: 32)
   --io-workers IO_WORKERS
@@ -101,6 +106,19 @@ multi-scale analysis options:
   --multiscale-levels MULTISCALE_LEVELS
                         Number of pyramid levels for multi-scale analysis (default: 4)
 
+fire-metric verdict thresholds:
+  --iou-threshold IOU_THRESHOLD
+                        IoU PASS threshold (default: 0.95)
+  --iou-warn IOU_WARN   IoU WARN threshold (default: 0.85)
+  --drift-threshold DRIFT_THRESHOLD
+                        Centroid drift PASS threshold in pixels (default: 5.0)
+  --drift-warn DRIFT_WARN
+                        Centroid drift WARN threshold in pixels (default: 10.0)
+  --area-diff-threshold AREA_DIFF_THRESHOLD
+                        Area diff PASS threshold as fraction (default: 0.05)
+  --area-diff-warn AREA_DIFF_WARN
+                        Area diff WARN threshold as fraction (default: 0.15)
+
 output formats:
   html   - rich HTML report with methodology, summary, per-project details
   md     - Markdown report (same structure as HTML)
@@ -114,6 +132,7 @@ examples:
   qf-compare --group-a projects/A --group-b projects/B --output all --output-dir results/
   qf-compare --group-a projects/A --group-b projects/B --fire-threshold 50
   qf-compare --group-a projects/A --group-b projects/B --no-mask-rendering --no-edge-metrics
+  qf-compare --group-a projects/A --group-b projects/B --iou-threshold 0.90 --drift-threshold 10
 ```
 
 ---
@@ -503,33 +522,54 @@ Only PNG files present in **all** runs of a project are compared (set
 intersection).  Static frames (terrain elevation, fuel height, initial
 ignitions) are excluded.
 
-### Deviation score
+### Image categorization (v3.0)
 
-The deviation score is a z-score that asks: "Does the cross-group MAE
-exceed what we would expect from run-to-run variability alone?"
+Each output PNG is classified by type based on its filename category:
+
+| Type | Categories |
+|------|-----------|
+| **fire** | `perc_mass_burnt`, `bw_perc_mass_burnt`, `fuel_dens_Plane`, `wplume_Plane` |
+| **wind** | `u_qu_*`, `v_qu_*`, `w_qu_*` |
+| **emissions** | `co_emissions`, `pm_emissions` |
+| **other** | Everything else |
+
+**Only fire-category images drive verdicts.** Wind field images use
+colormap auto-scaling that amplifies tiny float differences into large
+pixel changes, making SSIM unreliable for those categories.
+
+### Fire-metric verdicts (v3.0)
+
+Verdicts are based on absolute fire-metric thresholds applied to
+fire-category cross-group comparisons:
+
+| Criterion | PASS | WARN | FAIL |
+|-----------|------|------|------|
+| **Fire IoU** | >= 0.95 | >= 0.85 | < 0.85 |
+| **Centroid Drift** (px) | <= 5.0 | <= 10.0 | > 10.0 |
+| **Area Diff %** | <= 5% | <= 15% | > 15% |
+| **Temporal** | No violations | Violations | -- |
+
+The overall project verdict is the **worst** of the per-criterion verdicts.
+If no fire-category images exist, the verdict is **SKIP**.
+
+All thresholds are configurable via CLI flags (`--iou-threshold`,
+`--drift-threshold`, `--area-diff-threshold`, etc.).
+
+### SSIM deviation score (informational)
+
+The SSIM-based deviation score is still computed and reported for
+reference, but it no longer drives verdicts:
 
 ```
-intra_MAE_mean, intra_MAE_std = stats(intra_A_maes + intra_B_maes)
-deviation = (cross_MAE_mean - intra_MAE_mean) / intra_MAE_std
+deviation = (intra_SSIM_mean - cross_SSIM_mean) / intra_SSIM_std
 ```
-
-When masking is enabled (default), the MAE values used are **masked MAE**
-(excluding rendering regions and anti-aliased boundaries).
-
-| Deviation | Verdict |
-|-----------|---------|
-| <= sigma (default 2.0) | **PASS** |
-| <= 2 * sigma | **WARN** |
-| > 2 * sigma | **FAIL** |
-
-The `--sigma` flag controls this threshold.
 
 ### Flagged images
 
-Individual images are flagged when their average cross-group MAE exceeds
-`intra_MAE_mean + sigma * max(intra_MAE_std, 0.01)`.  Up to 20 flagged
-images per project are reported, sorted by descending MAE.  Each flagged
-image receives:
+Fire-category images whose average cross-group IoU falls below the IoU
+threshold (`--iou-threshold`, default 0.95) are flagged for manual review.
+Up to 20 flagged images per project are reported, sorted by ascending IoU
+(worst first).  Each flagged image receives:
 
 - A difference heatmap (unless `--no-heatmaps`)
 - Multi-scale analysis classifying errors as fine-grained, structural, or uniform
@@ -540,8 +580,8 @@ image receives:
 
 | Format | File | Description |
 |--------|------|-------------|
-| Console | (stdout) | Always printed.  Summary table with masked MAE, raw MAE, coverage, IoU, verdict, and flagged-image details. |
-| HTML | `report.html` | Full report with methodology section, summary table, per-project metrics (including masked, edge, boundary metrics), time-series MAE tables, flagged images with heatmaps and scale analysis, temporal gradient details, and per-category breakdowns. |
+| Console | (stdout) | Always printed.  Summary table with fire IoU, drift, area diff %, per-criterion verdicts, SSIM (info), and flagged-image details. |
+| HTML | `report.html` | Full report with methodology section, fire-metric verdict table, summary table, per-project metrics with per-criterion verdicts, time-series tables, flagged images with heatmaps and scale analysis, temporal gradient details, and per-category breakdowns. |
 | Markdown | `report.md` | Same logical structure as HTML in GFM pipe-table format. |
 | CSV | `comparison_results.csv` | One row per image pair with all metrics (see below). |
 
@@ -559,11 +599,11 @@ The CSV includes the following columns:
 
 | Column group | Columns |
 |-------------|---------|
-| **Identity** | `project`, `png_name`, `category`, `timestep`, `run_a`, `run_b`, `pair_type` |
-| **Perceptual** | `mae`, `rmse`, `psnr`, `ssim`, `hist_corr` |
+| **Identity** | `project`, `png_name`, `category`, `image_type`, `timestep`, `run_a`, `run_b`, `pair_type` |
+| **Perceptual** | `ssim`, `hist_corr` |
 | **Fire** | `fire_iou`, `fire_area_a`, `fire_area_b`, `fire_area_diff`, `centroid_drift` |
-| **Masked** | `masked_mae`, `masked_rmse`, `mask_coverage`, `rendering_diff` |
-| **Edge** | `edge_mae`, `edge_correlation`, `edge_iou`, `boundary_iou`, `boundary_length_diff`, `hausdorff_approx` |
+| **Masked** | `masked_ssim`, `mask_coverage` |
+| **Edge** | `edge_correlation`, `edge_iou`, `boundary_iou`, `boundary_length_diff`, `hausdorff_approx` |
 
 ---
 
